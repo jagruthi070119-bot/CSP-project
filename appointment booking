@@ -1,0 +1,67 @@
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth.decorators import login_required
+from django.db import transaction
+from .models import DoctorSchedule, TimeSlot, Appointment, SlotStatus, AppointmentStatus
+import datetime
+
+def ensure_slots_for_doctor_and_date(doctor, query_date):
+    """Self-healing slot engine: generates slots on the fly if none exist."""
+    if TimeSlot.objects.filter(doctor=doctor, date=query_date).exists():
+        return
+
+    weekday = query_date.weekday()
+    schedules = DoctorSchedule.objects.filter(doctor=doctor, day_of_week=weekday, is_active=True)
+
+    if not schedules.exists():
+        # Provision default clinic schedule (Mon-Sat, 9 AM - 5 PM)
+        for day in range(6):
+            DoctorSchedule.objects.get_or_create(
+                doctor=doctor, day_of_week=day, start_time=datetime.time(9, 0),
+                defaults={'end_time': datetime.time(17, 0), 'slot_duration_minutes': 30, 'is_active': True}
+            )
+        schedules = DoctorSchedule.objects.filter(doctor=doctor, day_of_week=weekday, is_active=True)
+
+    for sched in schedules:
+        curr_dt = datetime.datetime.combine(query_date, sched.start_time)
+        end_dt = datetime.datetime.combine(query_date, sched.end_time)
+        delta = datetime.timedelta(minutes=sched.slot_duration_minutes)
+        while curr_dt + delta <= end_dt:
+            TimeSlot.objects.get_or_create(
+                doctor=doctor, date=query_date, start_time=curr_dt.time(),
+                defaults={'end_time': (curr_dt + delta).time(), 'status': SlotStatus.AVAILABLE}
+            )
+            curr_dt += delta
+
+@login_required
+def book_appointment_view(request):
+    patient, _ = Patient.objects.get_or_create(
+        user=request.user,
+        defaults={'age': 30, 'gender': 'Other', 'phone': 'N/A', 'blood_group': 'O+', 'address': 'N/A'}
+    )
+    if request.method == 'POST':
+        doctor_id = request.POST.get('doctor')
+        date_str = request.POST.get('date')
+        slot_id = request.POST.get('slot')
+        reason = request.POST.get('reason', '').strip()
+
+        query_date = datetime.date.fromisoformat(date_str)
+        doctor = get_object_or_404(Doctor, id=doctor_id)
+        ensure_slots_for_doctor_and_date(doctor, query_date)
+
+        with transaction.atomic():
+            # select_for_update prevents concurrent double booking
+            slot = TimeSlot.objects.select_for_update().get(id=slot_id, doctor=doctor)
+            if slot.status != SlotStatus.AVAILABLE:
+                return redirect('book_appointment')
+
+            appointment = Appointment.objects.create(
+                patient=patient, doctor=doctor, time_slot=slot,
+                appointment_date=slot.date, appointment_time=slot.start_time,
+                reason=reason, status=AppointmentStatus.PENDING
+            )
+            slot.status = SlotStatus.RESERVED
+            slot.save()
+            return redirect('patient_dashboard')
+
+    doctors = Doctor.objects.filter(is_available=True)
+    return render(request, 'appointments/book_appointment.html', {'doctors': doctors})
